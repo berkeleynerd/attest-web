@@ -1,0 +1,19 @@
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# IDE / tool-specific
+.idea/
+.junie/
+
+# GPG keyring used during fixture generation (contains private key material)
+test-gpg/
+
+# One-shot generator scripts and scratch files from local dev
+find-short.py
+key-gen.txt
+test_pubkey.hex
+test.html
+test.attest.html
