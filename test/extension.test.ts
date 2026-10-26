@@ -58,7 +58,7 @@ test("interrupted and failed stream writes never yield authenticated bytes", () 
 });
 
 const url = "https://example.org/page";
-const authentic: PageVerification = {url, byteSource: "exact-response", result: {verdict: "AUTHENTIC"}};
+const authentic: PageVerification = {url, byteSource: "exact-response", result: {verdict: "AUTHENTIC"}, responsePolicy: {allowed: true}};
 
 test("only authenticated delivered bytes produce a green AUTHENTIC presentation", () => {
   assert.equal(presentation(authentic).label, "AUTHENTIC");

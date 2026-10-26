@@ -18,6 +18,22 @@ after browser decompression. Interrupted streams, responses over 16 MiB,
 downloads without a committed document, and history restores without a capture
 cannot receive an authenticated verdict.
 
+Green also requires the captured response to pass the display-header policy.
+The main-frame headers are checked before streaming, and attributed to the same
+request, tab, and URL as the captured bytes. A valid body signature with unsupported
+headers remains yellow **BODY VERIFIED**, with the reason shown in the popup.
+The cryptographic result stays AUTHENTIC; unsigned headers are not signed claims.
+
+The supported response is HTTP 200 with exactly one explicit `Content-Type`:
+`text/html; charset=utf-8` or `application/xhtml+xml; charset=utf-8`, and a valid
+UTF-8 body. Green is withheld for `Link`, `Refresh`, either CSP header,
+`Content-Language`, `Content-Disposition`, `Content-Location`, or
+`Content-Style-Type`. This conservative policy includes restrictive CSP because
+it can suppress signed styles. Missing, conflicting, or unsupported MIME/charset
+metadata also withholds green. Ordinary transport/cache headers and gzip remain
+supported. These checks cover response interpretation; they do not certify
+static-profile conformance or identical rendering across browser settings.
+
 Chrome MV3 verifies a separate `fetch` response. That response can differ from
 the displayed document, so successful verification is yellow, labeled
 **RE-FETCH VERIFIED**, with an explicit explanation that the displayed page has
@@ -26,7 +42,8 @@ independent fetch. Navigation tokens discard stale asynchronous results.
 
 | Color | Display | Meaning |
 |---|---|---|
-| Green | AUTHENTIC | Delivered response verifies against the expected key. Firefox only. |
+| Green | AUTHENTIC | Delivered UTF-8 body verifies against the expected key and passes the response-header policy. Firefox only. |
+| Yellow | BODY VERIFIED | Delivered body verifies against the expected key; response headers or encoding prevent display assurance. |
 | Yellow | RE-FETCH VERIFIED | A separate response verifies; the displayed page remains unauthenticated. |
 | Yellow | CRYPTO-VALID | Delivered bytes verify with a known key, without an expected fingerprint. |
 | Red | INVALID | Hash/signature failure or a verified signer that differs from the expected key. |
@@ -57,6 +74,13 @@ expected fingerprint, a signature verified with a known key returns
 CRYPTO-VALID. An unavailable public key returns UNKNOWN. Evidence-trailer
 metadata is unsigned; the popup displays only the verified fingerprint, using
 text nodes rather than interpreting metadata as HTML.
+
+The library reports body-byte cryptography independently of HTTP metadata. It
+cannot apply the extension's display-header checks without a delivered response.
+Malformed or unsupported signatures return UNKNOWN; cryptographically invalid
+signatures or a verified unexpected signer return INVALID. The GPG-backed CLI
+supports more key/signature profiles and evaluates key status, so its labels can
+differ without a browser acceptance of unsigned bytes.
 
 ## Build and test
 
@@ -93,4 +117,8 @@ FIREFOX_BIN=/path/to/firefox GECKODRIVER_BIN=/path/to/geckodriver \
 
 It exercises delivered HTML and XHTML, streamed/gzip responses, a response that
 changes between requests, redirects, same-URL reloads, and unsigned appended
-content. This repository does not deploy or install the extension automatically.
+content. It also serves identical signed bytes under stylesheet Link, Refresh,
+permissive/restrictive CSP, language/disposition, and MIME/charset headers; it
+checks actual badge colors, visible injected/suppressed CSS content, and header
+attribution across reloads/redirects. `ATTEST_SMOKE_REPORT` optionally saves JSON
+observations. This repository does not deploy or install the extension automatically.

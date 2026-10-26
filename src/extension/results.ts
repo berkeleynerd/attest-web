@@ -1,17 +1,23 @@
 import type { VerifyResult } from "../verify-core/types";
+import type { ResponsePolicy } from "./response-policy";
 
 export type ByteSource = "exact-response" | "refetch" | "unavailable";
 export interface PageVerification {
   url: string;
   byteSource: ByteSource;
   result: VerifyResult;
+  responsePolicy?: ResponsePolicy;
   error?: string;
 }
 
 export function presentation(page: PageVerification): { color: string; label: string; explanation: string } {
   if (page.result.verdict === "INVALID") return {color: "#f44336", label: "INVALID", explanation: "The signature or expected signing key did not verify."};
   if (page.result.verdict === "AUTHENTIC" && page.byteSource === "exact-response") {
-    return {color: "#4caf50", label: "AUTHENTIC", explanation: "The delivered response bytes verify against the expected signing key."};
+    if (page.responsePolicy?.allowed !== true) {
+      const reason = page.responsePolicy?.reason ?? "The delivered response headers could not be checked.";
+      return {color: "#ffeb3b", label: "BODY VERIFIED", explanation: `The signed body verifies against the expected key. ${reason} The displayed content has not been authenticated.`};
+    }
+    return {color: "#4caf50", label: "AUTHENTIC", explanation: "The delivered UTF-8 page body verifies against the expected signing key, and its response passed the display-header checks."};
   }
   if (["AUTHENTIC", "CRYPTO-VALID"].includes(page.result.verdict) && page.byteSource === "refetch") {
     return {color: "#ffeb3b", label: "RE-FETCH VERIFIED", explanation: "A separate response verifies. The displayed page has not been authenticated."};

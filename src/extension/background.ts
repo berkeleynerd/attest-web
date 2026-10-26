@@ -3,6 +3,8 @@ import { captureResponse } from "./capture";
 import { presentation, Results } from "./results";
 import type { PageVerification } from "./results";
 import { DeliveredPages } from "./navigation";
+import { checkResponseDisplay, checkResponseHeaders } from "./response-policy";
+import type { ResponsePolicy } from "./response-policy";
 
 const expectedFingerprint = "C6174EFE4839EBCFE724670FAE2EC3CBB111EB87";
 const results = new Results();
@@ -23,8 +25,22 @@ function finish(tabId: number, token: object, page: PageVerification): void {
   if (results.finish(tabId, token, page)) badge(tabId, page);
 }
 const delivered = new DeliveredPages(results, badge);
+const responses = new Map<string, {tabId: number; url: string; started: number; policy: ResponsePolicy | undefined}>();
 
 if (exactCapture) {
+  // Blocking delivery orders this read-only check before the response stream.
+  // A nonblocking observer can arrive after EOF, losing metadata for fast pages.
+  browser.webRequest.onHeadersReceived.addListener((details) => {
+    const response = responses.get(details.requestId);
+    if (!response || response.tabId !== details.tabId || response.url !== details.url || details.timeStamp < response.started) return;
+    response.policy = checkResponseHeaders(details.statusCode, details.responseHeaders);
+  }, {urls: ["http://*/*", "https://*/*"], types: ["main_frame"]}, ["blocking", "responseHeaders"]);
+  browser.webRequest.onErrorOccurred.addListener((details) => {
+    const response = responses.get(details.requestId);
+    if (!response) return;
+    response.policy = {allowed: false, reason: "The response did not complete successfully."};
+    responses.delete(details.requestId);
+  }, {urls: ["http://*/*", "https://*/*"], types: ["main_frame"]});
   browser.webNavigation.onBeforeNavigate.addListener((details) => {
     if (details.frameId === 0) delivered.navigate(details.tabId, details.url, details.timeStamp);
   });
@@ -40,9 +56,13 @@ if (exactCapture) {
   browser.webRequest.onBeforeRequest.addListener((details) => {
     if (details.tabId < 0) return;
     const capture = delivered.capture(details.tabId, details.url, details.timeStamp);
+    const response = {tabId: details.tabId, url: details.url, started: details.timeStamp, policy: undefined as ResponsePolicy | undefined};
+    responses.set(details.requestId, response);
+    const forget = () => { if (responses.get(details.requestId) === response) responses.delete(details.requestId); };
     try {
       const filter = browser.webRequest.filterResponseData(details.requestId);
       captureResponse(filter, (bytes) => {
+        forget();
         if (!capture) return;
         delivered.end(details.tabId, capture);
         // Do not authenticate an interrupted stream, or an earlier navigation.
@@ -50,11 +70,13 @@ if (exactCapture) {
           delivered.complete(details.tabId, capture, {url: details.url, byteSource: "unavailable", result: {verdict: "UNKNOWN"}, error: "Response capture was incomplete or exceeded 16 MiB."});
           return;
         }
+        const responsePolicy = checkResponseDisplay(response.policy, bytes);
         void verify(bytes, {expectedFingerprint}).then((result) => {
-          delivered.complete(details.tabId, capture, {url: details.url, byteSource: "exact-response", result});
+          delivered.complete(details.tabId, capture, {url: details.url, byteSource: "exact-response", result, responsePolicy});
         }).catch(() => delivered.complete(details.tabId, capture, {url: details.url, byteSource: "unavailable", result: {verdict: "UNKNOWN"}}));
       });
     } catch {
+      forget();
       if (capture) delivered.complete(details.tabId, capture, {url: details.url, byteSource: "unavailable", result: {verdict: "UNKNOWN"}, error: "This response could not be captured."});
     }
   }, {urls: ["http://*/*", "https://*/*"], types: ["main_frame"]}, ["blocking"]);
@@ -82,7 +104,10 @@ chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
     }
   })();
 });
-chrome.tabs.onRemoved.addListener((tabId) => delivered.remove(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  delivered.remove(tabId);
+  for (const [id, response] of responses) if (response.tabId === tabId) responses.delete(id);
+});
 chrome.runtime.onMessage.addListener((message: unknown, _sender, respond) => {
   if (!message || typeof message !== "object" || !("type" in message) || message.type !== "get-verification") return;
   const query = message as {tabId?: unknown; url?: unknown};

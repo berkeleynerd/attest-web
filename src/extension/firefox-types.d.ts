@@ -1,4 +1,5 @@
 import type { ResponseFilter } from "./capture";
+import type { ResponseHeader } from "./response-policy";
 declare global {
   const browser: {
     webRequest: {
@@ -6,6 +7,13 @@ declare global {
       onBeforeRequest: {
         addListener(callback: (details: {requestId: string; tabId: number; url: string; timeStamp: number}) => void,
           filter: {urls: string[]; types: string[]}, extraInfo: string[]): void;
+      };
+      onHeadersReceived: {
+        addListener(callback: (details: {requestId: string; tabId: number; url: string; timeStamp: number; statusCode: number; responseHeaders?: ResponseHeader[]}) => void,
+          filter: {urls: string[]; types: string[]}, extraInfo: string[]): void;
+      };
+      onErrorOccurred: {
+        addListener(callback: (details: {requestId: string}) => void, filter: {urls: string[]; types: string[]}): void;
       };
     };
     webNavigation: {

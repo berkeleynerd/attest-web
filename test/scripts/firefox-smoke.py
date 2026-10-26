@@ -49,7 +49,7 @@ def main():
         fingerprint = next(line[9] for line in fields if line[0] == "fpr")
         point = next(line[3] for line in fields if line[:2] == ["pkd", "1"])
         assert re.fullmatch("40[0-9A-Fa-f]{64}", point)
-        payload = b'<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta charset="utf-8" /><title>Firefox Test</title><style>/*<![CDATA[*/p::before{content:"A & B < C"}/*]]>*/</style></head><body><p>Signed page</p></body></html>\n'
+        payload = '<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta charset="utf-8" /><title>Firefox Test</title><style>/*<![CDATA[*/p::before{content:"A & B < C"}/*]]>*/</style></head><body><p>Signed page Café 日本語</p></body></html>\n'.encode()
         input_file, signed_file = work / "input.html", work / "signed.html"
         input_file.write_bytes(payload)
         run([tool, "sign", "-k", fingerprint, "-o", signed_file, input_file])
@@ -69,6 +69,11 @@ for (const name of ['navigate','capture','commit','end','complete','navigationEr
  delivered[name] = (...args) => { testEvents.push({name,args}); return original(...args); };
 }
 chrome.runtime.onMessage.addListener((message,_sender,respond) => { if(message?.type==='test-events') respond(testEvents); });
+for (const [name, extra] of [['onBeforeRequest', []], ['onHeadersReceived', ['responseHeaders']], ['onErrorOccurred', []]]) {
+ const args = [details => testEvents.push({name, details}), {urls:['http://*/*','https://*/*'], types:['main_frame']}];
+ if (name !== 'onErrorOccurred') args.push(extra);
+ browser.webRequest[name].addListener(...args);
+}
 """
         background.write_text(background_text.replace('const delivered = new DeliveredPages(results, badge);', 'const delivered = new DeliveredPages(results, badge);' + trace))
         (sources / "verify-core/trust.ts").write_text("export const TRUSTED_KEYS: Record<string,string> = " + json.dumps({fingerprint: point[2:]}) + ";\n")
@@ -81,15 +86,42 @@ chrome.runtime.onMessage.addListener((message,_sender,respond) => { if(message?.
                     archive.write(path, str(path.relative_to(extension)))
 
         counts = collections.Counter()
-        mode = {"reload": signed}
+        mode = {"reload": signed, "headers": []}
+        observations = []
+        header_cases = {
+            "/header-link": [("Link", '</unsigned.css>; rel="stylesheet"')],
+            "/header-refresh": [("Refresh", "3; url=/plain")],
+            "/header-csp-permissive": [("Content-Security-Policy", "default-src * 'unsafe-inline'")],
+            "/header-csp-restrictive": [("Content-Security-Policy", "default-src 'none'; style-src 'none'")],
+            "/header-csp-report": [("Content-Security-Policy-Report-Only", "default-src 'none'; report-uri /report")],
+            "/header-language": [("Content-Language", "fr")],
+            "/header-inline": [("Content-Disposition", "inline")],
+        }
+        content_types = {
+            "/header-plain": "text/plain; charset=utf-8",
+            "/header-utf16": "text/html; charset=utf-16le",
+            "/header-no-charset": "text/html",
+            "/header-no-type": None,
+        }
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 counts[self.path] += 1
-                if self.path == "/redirect":
+                if self.path in ["/redirect", "/redirect-unsupported", "/redirect-to-unsupported"]:
                     self.send_response(302)
-                    self.send_header("Location", "/signed")
+                    self.send_header("Location", "/header-link" if self.path == "/redirect-to-unsupported" else "/signed")
+                    if self.path == "/redirect-unsupported":
+                        self.send_header("Link", '</unsigned.css>; rel="stylesheet"')
+                        self.send_header("Content-Security-Policy", "default-src 'none'")
                     self.end_headers()
+                    return
+                if self.path == "/unsigned.css":
+                    body = b'p::after{content:"UNSIGNED HEADER TEXT"} p{color:rgb(201,17,88)}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/css; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
                 body = altered if self.path == "/alternate" and counts[self.path] == 1 else signed
                 if self.path == "/reload": body = mode["reload"]
@@ -97,11 +129,14 @@ chrome.runtime.onMessage.addListener((message,_sender,respond) => { if(message?.
                 if self.path == "/appended": body = signed + b"<p>Unsigned content</p>"
                 if self.path == "/gzip": body = gzip.compress(body)
                 self.send_response(200)
-                self.send_header("Content-Type", "application/xhtml+xml; charset=utf-8" if self.path == "/xml" else "text/html; charset=utf-8")
+                content_type = content_types.get(self.path, "application/xhtml+xml; charset=utf-8" if self.path == "/xml" else "text/html; charset=utf-8")
+                if content_type: self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 if self.path == "/gzip": self.send_header("Content-Encoding", "gzip")
                 if self.path == "/attachment": self.send_header("Content-Disposition", 'attachment; filename="signed.html"')
+                for name, value in header_cases.get(self.path, mode["headers"] if self.path == "/reload" else []):
+                    self.send_header(name, value)
                 self.end_headers()
                 try:
                     for offset in range(0, len(body), 37):
@@ -155,10 +190,10 @@ chrome.runtime.onMessage.addListener((message,_sender,respond) => { if(message?.
 
             def query(url=None):
                 api("POST", prefix + "/window", {"handle": probe_handle})
-                script = "const done=arguments[arguments.length-1]; browser.tabs.query({}).then(async tabs=>{const tab=tabs.find(t=>arguments[0] ? t.url===arguments[0] : t.url.startsWith(arguments[1])); if(!tab){done(null);return;} const page=await browser.runtime.sendMessage({type:'get-verification',tabId:tab.id,url:tab.url}); const badge=await browser.browserAction.getBadgeText({tabId:tab.id}); const trace=await browser.runtime.sendMessage({type:'test-events'}); done({page,badge,trace});}).catch(e=>done({error:String(e)}));"
+                script = "const done=arguments[arguments.length-1]; browser.tabs.query({}).then(async tabs=>{const tab=tabs.find(t=>arguments[0] ? t.url===arguments[0] : t.url.startsWith(arguments[1])); if(!tab){done(null);return;} const page=await browser.runtime.sendMessage({type:'get-verification',tabId:tab.id,url:tab.url}); const badge=await browser.browserAction.getBadgeText({tabId:tab.id}); const color=await browser.browserAction.getBadgeBackgroundColor({tabId:tab.id}); const trace=await browser.runtime.sendMessage({type:'test-events'}); done({page,badge,color,trace});}).catch(e=>done({error:String(e)}));"
                 return api("POST", prefix + "/execute/async", {"script": script, "args": [url, origin]})
 
-            def check(path, expected=None):
+            def check(path, expected=None, green=True):
                 api("POST", prefix + "/window", {"handle": page_handle})
                 api("POST", prefix + "/url", {"url": origin + path})
                 result = None
@@ -169,28 +204,64 @@ chrome.runtime.onMessage.addListener((message,_sender,respond) => { if(message?.
                     time.sleep(0.05)
                 assert result and "page" in result, (path, result)
                 verdict = result["page"]["result"]["verdict"]
-                if expected: assert verdict == expected, (path, result)
+                if expected:
+                    if verdict != expected or expected == "AUTHENTIC" and result["page"].get("responsePolicy", {}).get("allowed") is not green:
+                        print(json.dumps([event for event in result["trace"] if event.get("details", {}).get("url") == origin + path], indent=2), flush=True)
+                    assert verdict == expected, (path, result)
+                    if expected == "AUTHENTIC":
+                        assert result["page"].get("responsePolicy", {}).get("allowed") is green, (path, result)
+                        assert (result["badge"] == "✓") is green, (path, result)
+                        assert (result["color"][:3] == [76, 175, 80]) is green, (path, result)
+                        if not green: assert result["color"][:3] == [255, 235, 59], (path, result)
                 else: assert verdict != "AUTHENTIC" and result["badge"] != "✓", (path, result)
-                print(path, verdict, result["page"]["byteSource"], flush=True)
+                observations.append({"path": path, **{k: result[k] for k in ["page", "badge", "color"]}})
+                print(path, verdict, result["page"]["byteSource"], "green" if result["badge"] == "✓" else "not green", flush=True)
                 return result
 
             for path in ["/signed", "/gzip", "/xml"]: check(path, "AUTHENTIC")
+            for path in [*header_cases, *content_types]:
+                check(path, "AUTHENTIC", green=False)
+                if path in ["/header-link", "/header-csp-permissive", "/header-csp-restrictive"]:
+                    api("POST", prefix + "/window", {"handle": page_handle})
+                    display = api("POST", prefix + "/execute/sync", {"script": "const p=document.querySelector('p');return {before:getComputedStyle(p,'::before').content,after:getComputedStyle(p,'::after').content,color:getComputedStyle(p).color,text:p.textContent};", "args": []})
+                    if path == "/header-link":
+                        assert "UNSIGNED HEADER TEXT" in display["after"] and counts["/unsigned.css"] > 0, display
+                        assert display["color"] == "rgb(201, 17, 88)", display
+                    if path == "/header-csp-permissive": assert "A & B < C" in display["before"], display
+                    if path == "/header-csp-restrictive": assert display["before"] == "none", display
+                    observations[-1]["display"] = display
+            # Refresh cannot qualify for green before navigation, and the
+            # unsigned destination cannot inherit the body's valid signature.
+            check("/header-refresh", "AUTHENTIC", green=False)
+            for _ in range(100):
+                result = query(origin + "/plain")
+                if result and result.get("page", {}).get("result", {}).get("verdict") == "UNKNOWN": break
+                time.sleep(0.05)
+            assert result and result["badge"] != "✓" and result["page"]["result"]["verdict"] == "UNKNOWN", result
+            print("/header-refresh destination UNKNOWN", flush=True)
             check("/alternate", "INVALID")
             assert counts["/alternate"] == 1, "Firefox verified a second response instead of delivered bytes"
             check("/appended")
             check("/plain")
             check("/reload", "AUTHENTIC")
+            mode["headers"] = [("Link", '</unsigned.css>; rel="stylesheet"')]
+            check("/reload", "AUTHENTIC", green=False)
+            mode["headers"] = []
+            check("/reload", "AUTHENTIC")
             mode["reload"] = altered
             check("/reload", "INVALID")
             # A server redirect must verify the final delivered document.
-            api("POST", prefix + "/window", {"handle": page_handle})
-            api("POST", prefix + "/url", {"url": origin + "/redirect"})
-            for _ in range(100):
-                result = query(origin + "/signed")
-                if result and result.get("page", {}).get("result", {}).get("verdict") == "AUTHENTIC": break
-                time.sleep(0.05)
-            assert result["page"]["result"]["verdict"] == "AUTHENTIC", result
-            print("/redirect AUTHENTIC exact-response", flush=True)
+            for path, target, green in [("/redirect", "/signed", True), ("/redirect-unsupported", "/signed", True), ("/redirect-to-unsupported", "/header-link", False)]:
+                api("POST", prefix + "/window", {"handle": page_handle})
+                api("POST", prefix + "/url", {"url": origin + path})
+                for _ in range(100):
+                    result = query(origin + target)
+                    if result and result.get("page", {}).get("result", {}).get("verdict") == "AUTHENTIC": break
+                    time.sleep(0.05)
+                assert result["page"]["result"]["verdict"] == "AUTHENTIC", result
+                assert result["page"].get("responsePolicy", {}).get("allowed") is green, result
+                assert (result["badge"] == "✓") is green, result
+                print(path, "AUTHENTIC", "green" if green else "not green", flush=True)
             check("/signed", "AUTHENTIC")
             check("/plain")
             before = counts["/signed"]
@@ -216,7 +287,9 @@ chrome.runtime.onMessage.addListener((message,_sender,respond) => { if(message?.
             assert result and "page" in result, result
             assert result["page"]["result"]["verdict"] != "AUTHENTIC" and result["badge"] != "✓", result
             print("/attachment UNKNOWN (displayed page not replaced by the signed download)", flush=True)
-            print("Live Firefox response capture checks passed.", flush=True)
+            report = os.environ.get("ATTEST_SMOKE_REPORT")
+            if report: Path(report).write_text(json.dumps(observations, indent=2) + "\n")
+            print("Live Firefox response capture and header-policy checks passed.", flush=True)
         except Exception:
             driver_log.flush()
             print((work / "geckodriver.log").read_text(errors="replace")[-6000:])
