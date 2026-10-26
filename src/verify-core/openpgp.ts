@@ -1,95 +1,42 @@
+// Deliberately small profile: one binary-document v4 EdDSALegacy signature.
+// Bounds and trailing bytes are checked before any field is interpreted.
 export function dearmor(armor: string): Uint8Array {
-  const lines = armor.split(/\r?\n/);
-  const base64Lines: string[] = [];
-  let inBody = false;
-
-  for (const line of lines) {
-    if (line.startsWith("-----BEGIN")) {
-      inBody = true;
-      continue;
-    }
-    if (line.startsWith("-----END")) {
-      inBody = false;
-      continue;
-    }
-    if (!inBody) continue;
-
-    // Skip empty lines and headers like "Version: ..."
-    if (line.trim() === "" || line.includes(": ")) continue;
-
-    // Skip CRC line
-    if (line.startsWith("=")) continue;
-
-    base64Lines.push(line.trim());
-  }
-
-  const base64Str = base64Lines.join("");
-  let binStr: string;
-  try {
-    binStr = atob(base64Str);
-  } catch (e) {
-    throw new Error("UNKNOWN: Invalid base64 in armor");
-  }
-
-  const bytes = new Uint8Array(binStr.length);
-  for (let i = 0; i < binStr.length; i++) {
-    bytes[i] = binStr.charCodeAt(i);
-  }
-  return bytes;
+  const match = /^-----BEGIN PGP SIGNATURE-----\r?\n(?:[^\r\n:]+:[^\r\n]*\r?\n)*\r?\n([A-Za-z0-9+/=\r\n]+)-----END PGP SIGNATURE-----\s*$/.exec(armor);
+  if (!match) throw new Error("UNKNOWN: malformed signature armor");
+  const lines = match[1]!.split(/\r?\n/).filter(Boolean);
+  if (lines.at(-1)?.startsWith("=")) lines.pop();
+  const encoded = lines.join("");
+  const decoded = atob(encoded);
+  if (btoa(decoded) !== encoded) throw new Error("UNKNOWN: noncanonical signature base64");
+  return Uint8Array.from(decoded, (c) => c.charCodeAt(0));
 }
 
-function parsePacket(d: Uint8Array): { tag: number; body: Uint8Array } {
-  const b0 = d[0];
-  let tag: number, ln: number, off: number;
-
-  if (b0 & 0x40) {
-    // New format
-    tag = b0 & 0x3f;
-    off = 1;
-    const l = d[off];
-    if (l < 192) {
-      ln = l;
-      off += 1;
-    } else if (l < 224) {
-      ln = ((l - 192) << 8) + d[off + 1] + 192;
-      off += 2;
-    } else if (l === 255) {
-      const dv = new DataView(d.buffer, d.byteOffset + off + 1, 4);
-      ln = dv.getUint32(0, false);
-      off += 5;
-    } else {
-      throw new Error("UNKNOWN: partial length not supported");
-    }
-  } else {
-    // Old format
-    tag = (b0 >> 2) & 0x0f;
-    const lt = b0 & 3;
-    off = 1;
-    if (lt === 0) {
-      ln = d[off];
-      off += 1;
-    } else if (lt === 1) {
-      const dv = new DataView(d.buffer, d.byteOffset + off, 2);
-      ln = dv.getUint16(0, false);
-      off += 2;
-    } else if (lt === 2) {
-      const dv = new DataView(d.buffer, d.byteOffset + off, 4);
-      ln = dv.getUint32(0, false);
-      off += 4;
-    } else {
-      throw new Error("UNKNOWN: indeterminate length not supported");
-    }
+class Reader {
+  pos = 0;
+  constructor(readonly bytes: Uint8Array) {}
+  take(n: number): Uint8Array {
+    if (!Number.isSafeInteger(n) || n < 0 || this.pos + n > this.bytes.length) throw new Error("UNKNOWN: truncated OpenPGP packet");
+    const result = this.bytes.slice(this.pos, this.pos + n);
+    this.pos += n;
+    return result;
   }
-
-  return { tag, body: d.slice(off, off + ln) };
-}
-
-function readMpi(d: Uint8Array, p: number): { mpi: Uint8Array; nextP: number } {
-  const dv = new DataView(d.buffer, d.byteOffset + p, 2);
-  const bits = dv.getUint16(0, false);
-  p += 2;
-  const n = Math.floor((bits + 7) / 8);
-  return { mpi: d.slice(p, p + n), nextP: p + n };
+  byte(): number { return this.take(1)[0]!; }
+  uint(n: number): number { return this.take(n).reduce((value, b) => value * 256 + b, 0); }
+  length(): number {
+    const first = this.byte();
+    if (first < 192) return first;
+    if (first < 224) return (first - 192) * 256 + this.byte() + 192;
+    if (first === 255) return this.uint(4);
+    throw new Error("UNKNOWN: partial length not supported");
+  }
+  mpi(): Uint8Array {
+    const bits = this.uint(2);
+    if (bits > 256) throw new Error("UNKNOWN: MPI larger than 32 bytes");
+    return this.take(Math.ceil(bits / 8));
+  }
+  end(): void {
+    if (this.pos !== this.bytes.length) throw new Error("UNKNOWN: trailing OpenPGP bytes");
+  }
 }
 
 export interface ParsedSignature {
@@ -102,70 +49,42 @@ export interface ParsedSignature {
 }
 
 export function parseSignaturePacket(packet: Uint8Array): ParsedSignature {
-  const { tag, body } = parsePacket(packet);
-  if (tag !== 2) {
-    throw new Error("UNKNOWN: Expected signature packet (tag 2)");
-  }
-
-  if (body[0] !== 4 || body[1] !== 0x00 || body[2] !== 22) {
+  const outer = new Reader(packet);
+  const header = outer.byte();
+  if (!(header & 0x80)) throw new Error("UNKNOWN: invalid packet header");
+  const tag = header & 0x40 ? header & 0x3f : (header >> 2) & 0x0f;
+  if (tag !== 2) throw new Error("UNKNOWN: Expected signature packet (tag 2)");
+  const lengthType = header & 3;
+  if (!(header & 0x40) && lengthType === 3) throw new Error("UNKNOWN: indeterminate packet length");
+  const length = header & 0x40 ? outer.length() : outer.uint(2 ** lengthType);
+  const body = outer.take(length);
+  outer.end();
+  const reader = new Reader(body);
+  if (reader.byte() !== 4 || reader.byte() !== 0 || reader.byte() !== 22) {
     throw new Error("UNKNOWN: unsupported profile; verify with the gpg CLI");
   }
-
-  const hashAlgoId = body[3];
-  let hashAlgoName = "";
-  if (hashAlgoId === 8) hashAlgoName = "SHA-256";
-  else if (hashAlgoId === 9) hashAlgoName = "SHA-384";
-  else if (hashAlgoId === 10) hashAlgoName = "SHA-512";
-  else if (hashAlgoId === 11) {
-    // SHA-224 digest size is 28 bytes < 32 bytes (Ed25519 fsize)
-    throw new Error("UNKNOWN: digest size < 32 bytes");
-  } else {
-    throw new Error("UNKNOWN: unsupported hash algorithm");
-  }
-
-  const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
-  const hlen = dv.getUint16(4, false);
-  const hashedFields = body.slice(0, 6 + hlen);
-  
-  // Extract Issuer Fingerprint (type 33) from hashed subpackets
-  let issuerFingerprint: Uint8Array | undefined = undefined;
-  let subP = 6;
-  const subEnd = 6 + hlen;
-  while (subP < subEnd) {
-    let subLen = body[subP];
-    let subLenLen = 1;
-    if (subLen >= 192 && subLen < 255) {
-      subLen = ((subLen - 192) << 8) + body[subP + 1] + 192;
-      subLenLen = 2;
-    } else if (subLen === 255) {
-      subLen = dv.getUint32(subP + 1, false);
-      subLenLen = 5;
+  const hashAlgoName = ({8: "SHA-256", 9: "SHA-384", 10: "SHA-512"} as Record<number, string>)[reader.byte()];
+  if (!hashAlgoName) throw new Error("UNKNOWN: unsupported hash algorithm");
+  const hashed = new Reader(reader.take(reader.uint(2)));
+  const hashedFields = body.slice(0, reader.pos);
+  let issuerFingerprint: Uint8Array | undefined;
+  while (hashed.pos < hashed.bytes.length) {
+    const first = hashed.byte();
+    const size = first < 192 ? first : first < 255 ? (first - 192) * 256 + hashed.byte() + 192 : hashed.uint(4);
+    if (size < 1) throw new Error("UNKNOWN: empty signature subpacket");
+    const sub = new Reader(hashed.take(size));
+    const type = sub.byte();
+    if ((type & 0x80) && ![2, 33].includes(type & 0x7f)) throw new Error("UNKNOWN: unsupported critical subpacket");
+    if ((type & 0x7f) === 33) {
+      if (issuerFingerprint || sub.byte() !== 4 || sub.bytes.length !== 22) throw new Error("UNKNOWN: invalid issuer fingerprint");
+      issuerFingerprint = sub.take(20);
+      sub.end();
     }
-    const subType = body[subP + subLenLen] & 0x7f; // drop critical bit
-    const subData = body.slice(subP + subLenLen + 1, subP + subLenLen + subLen);
-    if (subType === 33) {
-      // Issuer Fingerprint
-      const v = subData[0];
-      if (v === 4 && subData.length === 21) {
-        issuerFingerprint = subData.slice(1);
-      }
-    }
-    subP += subLenLen + subLen;
   }
-
-  let p = 6 + hlen;
-  const uLen = dv.getUint16(p, false);
-  p += 2 + uLen;
-
-  const left16 = body.slice(p, p + 2);
-  p += 2;
-
-  const resR = readMpi(body, p);
-  const R = resR.mpi;
-  p = resR.nextP;
-
-  const resS = readMpi(body, p);
-  const S = resS.mpi;
-
-  return { hashAlgoName, hashedFields, left16, R, S, issuerFingerprint };
+  reader.take(reader.uint(2));
+  const left16 = reader.take(2);
+  const R = reader.mpi();
+  const S = reader.mpi();
+  reader.end();
+  return { hashAlgoName, hashedFields, left16, R, S, ...(issuerFingerprint ? {issuerFingerprint} : {}) };
 }

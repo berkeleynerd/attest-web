@@ -1,8 +1,8 @@
 import { parseTrailer } from "./trailer";
 import { dearmor, parseSignaturePacket } from "./openpgp";
 import { reconstructAndVerify, computeHash, bytesToHex } from "./crypto";
-import { TRUSTED_KEYS, getTrustedKeyHex } from "./trust";
-import { VerifyResult } from "./types";
+import { TRUSTED_KEYS } from "./trust";
+import type { VerifyResult } from "./types";
 
 export interface VerifyOptions {
   knownKeys?: Record<string, string>;
@@ -23,13 +23,14 @@ export async function verify(bytes: Uint8Array, options?: VerifyOptions): Promis
     let hashMatch = true;
     if (evidence.signed_prefix.sha256) {
       const h256 = await computeHash("SHA-256", payload);
-      if (h256 !== evidence.signed_prefix.sha256) hashMatch = false;
+      if (h256 !== evidence.signed_prefix.sha256.toLowerCase()) hashMatch = false;
     }
     if (evidence.signed_prefix.sha512) {
       const h512 = await computeHash("SHA-512", payload);
-      if (h512 !== evidence.signed_prefix.sha512) hashMatch = false;
+      if (h512 !== evidence.signed_prefix.sha512.toLowerCase()) hashMatch = false;
     }
 
+    if (!hashMatch) return { verdict: "INVALID", evidence, payloadLength: payload.length, hashMatch };
     const openpgpSig = evidence.signatures.find(
       (s) => s.kind === "openpgp-detached" && s.armor && s.armor.trim() !== ""
     );
@@ -81,7 +82,7 @@ export async function verify(bytes: Uint8Array, options?: VerifyOptions): Promis
       };
     }
 
-    if (signerFingerprintHex === options.expectedFingerprint) {
+    if (signerFingerprintHex === options.expectedFingerprint.replace(/\s/g, "").toUpperCase()) {
       return {
         verdict: "AUTHENTIC",
         evidence,
@@ -90,7 +91,7 @@ export async function verify(bytes: Uint8Array, options?: VerifyOptions): Promis
         hashMatch
       };
     } else {
-      // DEV-STAGE: this diverges from attest verify, which reports a valid signature from an untrusted signer as CRYPTO-VALID, not INVALID
+      // This verified key is not the expected signer.
       return {
         verdict: "INVALID",
         evidence,

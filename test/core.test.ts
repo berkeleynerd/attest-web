@@ -3,8 +3,10 @@ import * as assert from "node:assert";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { webcrypto } from "node:crypto";
-import { verify } from "../src/verify-core/index";
-import { TRUSTED_KEYS } from "../src/verify-core/trust";
+import { verify as verifyCore } from "../src/verify-core/index";
+import type { VerifyOptions } from "../src/verify-core/index";
+const TEST_KEYS = {FC0EE6372FB7C8DBA86B649F68150860153B19EC: "999866a772d618387041e54df5330baa49ab1d1c9c569331fdab16a72c08b896"};
+const verify = (bytes: Uint8Array, options?: VerifyOptions) => verifyCore(bytes, {knownKeys: TEST_KEYS, ...options});
 
 if (!globalThis.crypto) {
   (globalThis as any).crypto = webcrypto;
@@ -66,7 +68,7 @@ describe("verify-core", () => {
 
     await test("flips one payload byte -> INVALID", async () => {
       const bytes = new Uint8Array(origBytes);
-      bytes[0] ^= 1; // flip first byte
+      bytes[0] = bytes[0]! ^ 1; // flip first byte
       const res = await verify(bytes);
       assert.strictEqual(res.verdict, "INVALID");
       assert.strictEqual(res.hashMatch, false);
@@ -111,7 +113,7 @@ describe("verify-core", () => {
 
       let newBinStr = "";
       for (let i = 0; i < bytes.length; i++) {
-        newBinStr += String.fromCharCode(bytes[i]);
+        newBinStr += String.fromCharCode(bytes[i]!);
       }
       const newBase64 = btoa(newBinStr);
       
@@ -134,7 +136,7 @@ describe("verify-core", () => {
       const bytes = modifyTrailer(origBytes, (evidence) => {
         modifyArmorBinary(evidence, (bin) => {
           // S is the last 32 bytes (or so)
-          bin[bin.length - 1] ^= 1;
+          bin[bin.length - 1] = bin[bin.length - 1]! ^ 1;
         });
       });
       const res = await verify(bytes);
@@ -178,12 +180,12 @@ describe("verify-core", () => {
           // hitting any length or type headers which would cause a parsing error.
           const dv = new DataView(bin.buffer, bin.byteOffset, bin.byteLength);
           let off = 1;
-          const lt = bin[0] & 3;
+          const lt = bin[0]! & 3;
           if (lt === 0) off += 1;
           else if (lt === 1) off += 2;
           else if (lt === 2) off += 4;
           const hlen = dv.getUint16(off + 4, false);
-          bin[off + 6 + hlen - 1] ^= 1;
+          bin[off + 6 + hlen - 1] = bin[off + 6 + hlen - 1]! ^ 1;
         });
       });
       const res = await verify(bytes);
@@ -200,8 +202,7 @@ describe("verify-core", () => {
       const options: VerifyOptions = {
         knownKeys: {
           "FC0EE6372FB7C8DBA86B649F68150860153B19EC": "999866a772d618387041e54df5330baa49ab1d1c9c569331fdab16a72c08b896"
-        },
-        pinnedFingerprints: []
+        }
       };
       const res = await verify(bytes, options);
       assert.strictEqual(res.verdict, "CRYPTO-VALID"); // Because it's known but not pinned
