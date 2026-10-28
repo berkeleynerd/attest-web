@@ -1,6 +1,7 @@
-import { ParsedSignature } from "./openpgp";
+import type { ParsedSignature } from "./openpgp";
 
 export function hexToBytes(hex: string): Uint8Array {
+  if (!/^[0-9a-f]{64}$/i.test(hex)) throw new Error("UNKNOWN: invalid Ed25519 key");
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -67,7 +68,7 @@ export async function reconstructAndVerify(
   const pub32 = hexToBytes(pubKeyHex);
   const key = await cryptoSubtle.importKey(
     "raw",
-    pub32,
+    pub32.slice().buffer,
     { name: "Ed25519" },
     false,
     ["verify"]
@@ -80,6 +81,6 @@ export async function reconstructAndVerify(
 export async function computeHash(algo: string, data: Uint8Array): Promise<string> {
   const cryptoSubtle = globalThis.crypto?.subtle;
   if (!cryptoSubtle) return "";
-  const hashBuf = await cryptoSubtle.digest(algo, data);
+  const hashBuf = await cryptoSubtle.digest(algo, new Uint8Array(data).buffer);
   return bytesToHex(new Uint8Array(hashBuf));
 }

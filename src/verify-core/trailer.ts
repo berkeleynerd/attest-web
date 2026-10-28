@@ -1,4 +1,4 @@
-import { Evidence } from "./types";
+import type { Evidence } from "./types";
 
 const START_MARKER_STR = "\n<!--ATTEST EVIDENCE V1\n";
 const END_MARKER_STR = "\nATTEST END-->\n";
@@ -56,16 +56,21 @@ export function parseTrailer(bytes: Uint8Array): { payload: Uint8Array; evidence
   // Strip ASCII whitespace ( \t\n\r\f\v)
   const stripped: number[] = [];
   for (let i = 0; i < trailerBody.length; i++) {
-    const b = trailerBody[i];
+    const b = trailerBody[i]!;
     if (b !== 0x20 && b !== 0x09 && b !== 0x0A && b !== 0x0D && b !== 0x0C && b !== 0x0B) {
       stripped.push(b);
     }
   }
 
-  const base64Str = String.fromCharCode(...stripped);
+  // Avoid spreading arbitrarily large evidence blocks onto the JS call stack.
+  const base64Str = stripped.map((b) => String.fromCharCode(b)).join("");
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(base64Str)) {
+    throw new Error("UNKNOWN: Invalid base64 in trailer");
+  }
   let jsonStr: string;
   try {
     jsonStr = atob(base64Str);
+    if (btoa(jsonStr) !== base64Str) throw new Error("Noncanonical base64");
   } catch (e) {
     throw new Error("UNKNOWN: Invalid base64 in trailer");
   }
@@ -83,16 +88,19 @@ export function parseTrailer(bytes: Uint8Array): { payload: Uint8Array; evidence
     throw new Error("UNKNOWN: Invalid JSON in trailer");
   }
 
-  if (evidence.format !== "attest-evidence-v1") {
+  if (!evidence || evidence.format !== "attest-evidence-v1") {
     throw new Error("UNKNOWN: Invalid format in evidence");
   }
   if (evidence.version !== 1) {
     throw new Error("UNKNOWN: Invalid version in evidence");
   }
-  if (!evidence.signed_prefix || typeof evidence.signed_prefix.length !== "number") {
+  if (!evidence.signed_prefix || !Number.isSafeInteger(evidence.signed_prefix.length) || evidence.signed_prefix.length < 0 ||
+      !/^[0-9a-f]{64}$/i.test(evidence.signed_prefix.sha256 ?? "") ||
+      !/^[0-9a-f]{128}$/i.test(evidence.signed_prefix.sha512 ?? "")) {
     throw new Error("UNKNOWN: Missing signed_prefix.length");
   }
-  if (!Array.isArray(evidence.signatures) || evidence.signatures.length === 0) {
+  if (!Array.isArray(evidence.signatures) || evidence.signatures.length === 0 ||
+      evidence.signatures.some((s) => !s || typeof s.kind !== "string" || (s.kind === "openpgp-detached" && typeof s.armor !== "string"))) {
     throw new Error("UNKNOWN: Missing or empty signatures array");
   }
 
